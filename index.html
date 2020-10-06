@@ -1,0 +1,542 @@
+<html>
+<head>
+    <meta charset='utf-8'>
+    <meta http-equiv='X-UA-Compatible' content='IE=edge'>
+    <title>EncryptNicholas聊天信息加密</title>
+    <meta name='viewport' content='width=device-width, initial-scale=1'>
+    <!-- <link rel='stylesheet' type='text/css' media='screen' href='main.css'> -->
+    <!-- <script src='user_encrypt_class.js'></script> -->
+</head>
+<body>
+    <script>
+
+///////////////////////////////////////////////////////////////
+    var loadscript = (function(){
+        function carry(fn){
+            var allArgs = [];
+            return function next(){
+                var args = [].slice.call(arguments);
+                if(args.length > 0){
+                    allArgs = allArgs.concat(args);
+                    return next;
+                }else{
+                    return fn.apply(null, allArgs);
+                }
+            }
+        }
+        const loadfromsrc = async function (src){
+            await new Promise(function (resolve,reject) {
+                var script = document.createElement('script');
+                script.type = 'text/javascript';
+                script.async = true;
+                script.src = src;
+                script.onload = function (){
+                    resolve();
+                }
+                script.onerror = function (){
+                    reject();
+                }
+                document.head.appendChild(script);
+            })
+        }
+        return carry(async function(){
+            try {
+                for (let index = 0; index < arguments.length; index++) {
+                    if (typeof arguments[index] != "function") {
+                        await loadfromsrc(arguments[index]);
+                    }else{
+                        arguments[index](index)
+                    }
+                }
+            }
+            catch(err) {
+                console.log(err);
+            }
+            finally {
+                console.log("all are loaded!");
+            }
+        })
+    })();
+
+///////////////////////////////////////////////////////////////
+
+// 该处的加载模块的方式是由于 libsignal-protocol 没有 import 加载模式，故以此兼容方式来加载相关模块以方便调用
+// 下列模块可以根据需要来自行取舍
+loadscript('curve25519_concat.js')
+    (()=>{
+        //此处可运行加载curve25519_concat.js后的初始化代码。
+        console.log("加载加密模块 curve25519_concat 已完成")
+    })
+    ('libsignal-protocol.js')
+    (()=>{
+        //此处可运行加载libsignal-protocol.js后的初始化代码。
+        console.log("加载加密库模块 libsignal-protocol 已完成")
+    })
+    ("localforage.min.js")
+    (()=>{
+        //此处可运行加载localforage.js后的初始化代码。
+        console.log("加载存储接口模块 localforage.min 已完成")
+    })
+    (()=>{
+        //加载了基础功能补充代码块
+        window.Internal = Internal || {};
+        (function() {
+            'use strict';
+
+            var crypto = window.crypto;
+
+            if (!crypto || !crypto.subtle || typeof crypto.getRandomValues !== 'function') {
+                throw new Error('WebCrypto not found');
+            }
+
+            Internal.crypto = {
+                getRandomBytes: function(size) {
+                    var array = new Uint8Array(size);
+                    crypto.getRandomValues(array);
+                    return array.buffer;
+                },
+                encrypt: function(key, data, iv) {
+                    return crypto.subtle.importKey('raw', key, {name: 'AES-CBC'}, false, ['encrypt']).then(function(key) {
+                        return crypto.subtle.encrypt({name: 'AES-CBC', iv: new Uint8Array(iv)}, key, data);
+                    });
+                },
+                decrypt: function(key, data, iv) {
+                    return crypto.subtle.importKey('raw', key, {name: 'AES-CBC'}, false, ['decrypt']).then(function(key) {
+                        return crypto.subtle.decrypt({name: 'AES-CBC', iv: new Uint8Array(iv)}, key, data);
+                    });
+                },
+                sign: function(key, data) {
+                    return crypto.subtle.importKey('raw', key, {name: 'HMAC', hash: {name: 'SHA-256'}}, false, ['sign']).then(function(key) {
+                        return crypto.subtle.sign( {name: 'HMAC', hash: 'SHA-256'}, key, data);
+                    });
+                },
+
+                hash: function(data) {
+                    return crypto.subtle.digest({name: 'SHA-512'}, data);
+                },
+
+                HKDF: function(input, salt, info) {
+                    // Specific implementation of RFC 5869 that only returns the first 3 32-byte chunks
+                    // TODO: We dont always need the third chunk, we might skip it
+                    return Internal.crypto.sign(salt, input).then(function(PRK) {
+                        var infoBuffer = new ArrayBuffer(info.byteLength + 1 + 32);
+                        var infoArray = new Uint8Array(infoBuffer);
+                        infoArray.set(new Uint8Array(info), 32);
+                        infoArray[infoArray.length - 1] = 1;
+                        return Internal.crypto.sign(PRK, infoBuffer.slice(32)).then(function(T1) {
+                            infoArray.set(new Uint8Array(T1));
+                            infoArray[infoArray.length - 1] = 2;
+                            return Internal.crypto.sign(PRK, infoBuffer).then(function(T2) {
+                                infoArray.set(new Uint8Array(T2));
+                                infoArray[infoArray.length - 1] = 3;
+                                return Internal.crypto.sign(PRK, infoBuffer).then(function(T3) {
+                                    return [ T1, T2, T3 ];
+                                });
+                            });
+                        });
+                    });
+                },
+
+                // Curve 25519 crypto
+                createKeyPair: function(privKey) {
+                    if (privKey === undefined) {
+                        privKey = Internal.crypto.getRandomBytes(32);
+                    }
+                    return Internal.Curve.async.createKeyPair(privKey);
+                },
+                ECDHE: function(pubKey, privKey) {
+                    return Internal.Curve.async.ECDHE(pubKey, privKey);
+                },
+                Ed25519Sign: function(privKey, message) {
+                    return Internal.Curve.async.Ed25519Sign(privKey, message);
+                },
+                Ed25519Verify: function(pubKey, msg, sig) {
+                    return Internal.Curve.async.Ed25519Verify(pubKey, msg, sig);
+                }
+            };
+
+            // HKDF for TextSecure has a bit of additional handling - salts always end up being 32 bytes
+            Internal.HKDF = function(input, salt, info) {
+                if (salt.byteLength != 32) {
+                    throw new Error("Got salt of incorrect length");
+                }
+
+                return Internal.crypto.HKDF(input, salt,  util.toArrayBuffer(info));
+            };
+
+            Internal.verifyMAC = function(data, key, mac, length) {
+                return Internal.crypto.sign(key, data).then(function(calculated_mac) {
+                    if (mac.byteLength != length  || calculated_mac.byteLength < length) {
+                        throw new Error("Bad MAC length");
+                    }
+                    var a = new Uint8Array(calculated_mac);
+                    var b = new Uint8Array(mac);
+                    var result = 0;
+                    for (var i=0; i < mac.byteLength; ++i) {
+                        result = result | (a[i] ^ b[i]);
+                    }
+                    if (result !== 0) {
+                        throw new Error("Bad MAC");
+                    }
+                });
+            };
+
+            libsignal.HKDF = {
+                deriveSecrets: function(input, salt, info) {
+                    return Internal.HKDF(input, salt, info);
+                }
+            };
+
+            libsignal.crypto = {
+                encrypt: function(key, data, iv) {
+                    return Internal.crypto.encrypt(key, data, iv);
+                },
+                decrypt: function(key, data, iv) {
+                    return Internal.crypto.decrypt(key, data, iv);
+                },
+                calculateMAC: function(key, data) {
+                    return Internal.crypto.sign(key, data);
+                },
+                verifyMAC: function(data, key, mac, length) {
+                    return Internal.verifyMAC(data, key, mac, length);
+                },
+                getRandomBytes: function(size) {
+                    return Internal.crypto.getRandomBytes(size);
+                }
+            };
+
+        })();
+        (function() {
+            'use strict';
+
+            function validatePrivKey(privKey) {
+                if (privKey === undefined || !(privKey instanceof ArrayBuffer) || privKey.byteLength != 32) {
+                    throw new Error("Invalid private key");
+                }
+            }
+            function validatePubKeyFormat(pubKey) {
+                if (pubKey === undefined || ((pubKey.byteLength != 33 || new Uint8Array(pubKey)[0] != 5) && pubKey.byteLength != 32)) {
+                    throw new Error("Invalid public key");
+                }
+                if (pubKey.byteLength == 33) {
+                    return pubKey.slice(1);
+                } else {
+                    console.error("WARNING: Expected pubkey of length 33, please report the ST and client that generated the pubkey");
+                    return pubKey;
+                }
+            }
+
+            function processKeys(raw_keys) {
+                // prepend version byte
+                var origPub = new Uint8Array(raw_keys.pubKey);
+                var pub = new Uint8Array(33);
+                pub.set(origPub, 1);
+                pub[0] = 5;
+
+                return { pubKey: pub.buffer, privKey: raw_keys.privKey };
+            }
+
+            function wrapCurve25519(curve25519) {
+                return {
+                    // Curve 25519 crypto
+                    createKeyPair: function(privKey) {
+                        validatePrivKey(privKey);
+                        var raw_keys = curve25519.keyPair(privKey);
+                        if (raw_keys instanceof Promise) {
+                            return raw_keys.then(processKeys);
+                        } else {
+                            return processKeys(raw_keys);
+                        }
+                    },
+                    ECDHE: function(pubKey, privKey) {
+                        pubKey = validatePubKeyFormat(pubKey);
+                        validatePrivKey(privKey);
+
+                        if (pubKey === undefined || pubKey.byteLength != 32) {
+                            throw new Error("Invalid public key");
+                        }
+
+                        return curve25519.sharedSecret(pubKey, privKey);
+                    },
+                    Ed25519Sign: function(privKey, message) {
+                        validatePrivKey(privKey);
+
+                        if (message === undefined) {
+                            throw new Error("Invalid message");
+                        }
+
+                        return curve25519.sign(privKey, message);
+                    },
+                    Ed25519Verify: function(pubKey, msg, sig) {
+                        pubKey = validatePubKeyFormat(pubKey);
+
+                        if (pubKey === undefined || pubKey.byteLength != 32) {
+                            throw new Error("Invalid public key");
+                        }
+
+                        if (msg === undefined) {
+                            throw new Error("Invalid message");
+                        }
+
+                        if (sig === undefined || sig.byteLength != 64) {
+                            throw new Error("Invalid signature");
+                        }
+
+                        return curve25519.verify(pubKey, msg, sig);
+                    }
+                };
+            }
+
+            Internal.Curve       = wrapCurve25519(Internal.curve25519);
+            Internal.Curve.async = wrapCurve25519(Internal.curve25519_async);
+
+            function wrapCurve(curve){
+                return {
+                    generateKeyPair: function() {
+                        var privKey = Internal.crypto.getRandomBytes(32);
+                        return curve.createKeyPair(privKey);
+                    },
+                    createKeyPair: function(privKey) {
+                        return curve.createKeyPair(privKey);
+                    },
+                    calculateAgreement: function(pubKey, privKey) {
+                        return curve.ECDHE(pubKey, privKey);
+                    },
+                    verifySignature: function(pubKey, msg, sig) {
+                        return curve.Ed25519Verify(pubKey, msg, sig);
+                    },
+                    calculateSignature: function(privKey, message) {
+                        return curve.Ed25519Sign(privKey, message);
+                    }
+                };
+            }
+
+            libsignal.Curve       = wrapCurve(Internal.Curve);
+            libsignal.Curve.async = wrapCurve(Internal.Curve.async);
+
+        })();
+        window.util = (function() {
+            'use strict';
+
+            var StaticArrayBufferProto = new ArrayBuffer().__proto__;
+
+            return {
+                toString: function(thing) {
+                    if (typeof thing == 'string') {
+                        return thing;
+                    }
+                    return new dcodeIO.ByteBuffer.wrap(thing).toString('binary');
+                },
+                toArrayBuffer: function(thing) {
+                    if (thing === undefined) {
+                        return undefined;
+                    }
+                    if (thing === Object(thing)) {
+                        if (thing.__proto__ == StaticArrayBufferProto) {
+                            return thing;
+                        }
+                    }
+
+                    var str;
+                    if (typeof thing == "string") {
+                        str = thing;
+                    } else {
+                        throw new Error("Tried to convert a non-string of type " + typeof thing + " to an array buffer");
+                    }
+                    return new dcodeIO.ByteBuffer.wrap(thing, 'binary').toArrayBuffer();
+                },
+                isEqual: function(a, b) {
+                    // TODO: Special-case arraybuffers, etc
+                    if (a === undefined || b === undefined) {
+                        return false;
+                    }
+                    a = util.toString(a);
+                    b = util.toString(b);
+                    var maxLength = Math.max(a.length, b.length);
+                    if (maxLength < 5) {
+                        throw new Error("a/b compare too short");
+                    }
+                    return a.substring(0, Math.min(maxLength, a.length)) == b.substring(0, Math.min(maxLength, b.length));
+                },
+                hexToArrayBuffer: function(str) {
+                    var ret = new ArrayBuffer(str.length / 2);
+                    var array = new Uint8Array(ret);
+                    for (var i = 0; i < str.length/2; i++)
+                        array[i] = parseInt(str.substr(i*2, 2), 16);
+                    return ret;
+                },
+                strEncodeToBase64: function(str){
+                    // str to base64
+                    var encode = encodeURI(str);
+                    var base64 = btoa(encode);
+                    return base64;
+                },
+                base64DecodeToStr: function(base64){
+                    // base64 to str
+                    var decode = atob(base64);
+                    var str = decodeURI(decode);
+                    return str;
+                },
+                cutArraybuffer: function (input_ab,num) {
+                    let newArrayBuffer = new ArrayBuffer(num);
+                    let edit = new Uint8Array(newArrayBuffer);
+                    let inputViewer = new Uint8Array(input_ab);
+                    let count = 0;
+                    for (const inputViewerCount of inputViewer) {
+                        if (count == num) {break;}
+                        edit[count] = inputViewerCount;
+                        count++;
+                    }
+                    return newArrayBuffer;
+                }
+            };
+        })();
+    })
+    ("user_encrypt_class.js")
+    (()=>{
+        console.log("加载存储接口模块 user_encrypt_class 已完成")
+    })
+    ("wordtext.js")
+    (()=>{
+        console.log("加载字库 已完成")
+    })
+    ()
+    .then(()=>{
+        // console.log("模块加载完成，此处可以添加渲染代码!")
+        window.run = (function() {
+            'use strict';
+            var that = this;
+            window.publicKeyPair;
+            window.encryptv = new user_encrypt_class("null");
+            window.encryptv.generateUserKeyPair().then((i)=>{
+                // 生成对外公钥组，可以将该公钥组先发给对方
+                // console.log(i);
+                window.publicKeyPair = i;
+                window.document.getElementById('mypwd').value = window.publicKeyPair;
+            })
+
+            return {
+                copymykeypair: function() {
+                    // 复制我的密钥
+                    this.copydata(document.getElementById('mypwd').value)
+
+                    // document.getElementById("frdpwd").setAttribute("readonly", "true");
+                    // document.getElementById("mytext").setAttribute("readonly", "true");
+                },
+                pastefrdkeypair: function() {
+                    // 粘贴朋友的密钥
+                    navigator.clipboard.readText().then((text)=>{
+                        window.document.getElementById("frdpwd").value = text;
+                        window.encryptv.get_friend_publickey(text).then((t)=>{
+                            console.log(t)
+                        })
+                    })
+                },
+                encryptmytext: function() {
+                    if(document.getElementById("frdpwd").value == ''){
+                        window.document.getElementById("srcdata").innerHTML = "请输入朋友的ID"
+                        return;
+                    }
+                    // 加密我的内容
+                    window.encryptv.encrypt_msg(document.getElementById("mytext").value).then((encrypttext)=>{
+                        // console.log(encrypttext)
+                        let cnword = window.run.toCNword(encrypttext)
+                        window.document.getElementById("srcdata").innerHTML = "密文已经成功复制到你的粘贴板<br/><br/>"+ '密文：' + cnword;
+
+                        navigator.clipboard.writeText(cnword).then(() => {
+                            console.log('文本已经成功复制到剪切板');
+                        })
+                    })
+                },
+                decryptmytext: function() {
+                    if(document.getElementById("frdpwd").value == ''){
+                        window.document.getElementById("srcdata").innerHTML = "请输入朋友的ID"
+                        return;
+                    }
+                    // 解密我的内容
+                    window.encryptv.decrypt_msg(window.run.toStr(document.getElementById("mytext").value),(result,msg)=>{
+                        // console.log(msg)
+                        window.document.getElementById("srcdata").innerHTML = "原文已经成功复制到你的粘贴板<br/><br/>" + '原文：' + msg;
+                        navigator.clipboard.writeText(msg).then(() => {
+                            console.log('文本已经成功复制到剪切板');
+                        })
+                    })
+                },
+                copydata: function(text) {
+                    return navigator.clipboard.writeText(text)
+                    .then(() => {
+                        console.log('文本已经成功复制到剪切板');
+                    })
+                    .catch(err => {
+                        // 如果用户没有授权，则抛出异常
+                        console.error('无法复制此文本：', err);
+                    });
+                },
+                pastedata: function() {
+                    return navigator.clipboard.readText()
+                    .then(text => {
+                        document.getElementById("mytext").value = text;
+                        console.log('Pasted content: ', text);
+                    })
+                    .catch(err => {
+                        console.error('Failed to read clipboard contents: ', err);
+                    });
+                },
+                toCNword: function(str){
+                    let buff = []
+                    let strtoArrayBuffer = new Uint8Array(util.toArrayBuffer(str));
+                    for (const strtoArrayBufferElement of strtoArrayBuffer) {
+                        buff.push(word.cn[strtoArrayBufferElement])
+                    }
+                    return buff.join('');
+                },
+                toStr: function(CNword){
+                    let buff = [...CNword];
+                    let newArrayBuffer = new ArrayBuffer(CNword.length);
+                    let edit = new Uint8Array(newArrayBuffer);
+                    
+                    let count = 0;
+                    for(const temp of CNword){
+                        if (count == CNword.length) {break;}
+                        edit[count] = word.cn.indexOf(temp);
+                        count++;
+                    }
+                    return util.toString(newArrayBuffer);
+                }
+            };
+        })();
+    });
+
+///////////////////////////////////////////////////////////////
+
+</script>
+    <h2>EncryptNicholas&nbsp;&nbsp;beta version</h2>
+    my id:&nbsp;<input type="text" id="mypwd" name="mypwd" size="30" readonly placeholder="请稍后，正在生成你的ID中........">
+    <button id="copy_button" onclick="run.copymykeypair()">复制</button><br/>
+    friend id：&nbsp;<input type="text" id="frdpwd" name="frdpwd" size="30" readonly placeholder="请把朋友的ID粘贴在此处">
+    <button id="paste_button" onclick="run.pastefrdkeypair()">粘贴</button><br/><br/>
+
+    <p>注意，只有持有相应ID的朋友才能够解开信息，如果ID丢失或者更换ID，那么信息将永远无法解开。</p>
+
+    <textarea id="mytext" name="mytext" rows="4" cols="50" placeholder="这里填上你想说的话。"></textarea><br/>
+    <button onclick="run.pastedata()">一键粘贴</button>
+    <button onclick="run.copydata(document.getElementById('mytext').value)">一键复制</button>
+    <button onclick="run.encryptmytext()">加密</button>
+    <button onclick="run.decryptmytext()">解密</button>
+    <p id="srcdata"></p>
+    <hr/>
+    <h4>使用说明</h4>
+    <p>
+        首先：你与朋友各自打开该页面，朋友把他的<b>“my id”</b>发给你，你把它粘贴在<b>“friend id”</b>中。他也和你同样操作。
+    </p>
+    <p>
+        接着：就可以开始加密了。
+    </p>
+    <br/>
+    <br/>
+    <p><b>注意：</b>互相加密解密的时候，双方不能刷新页面，如果刷新了，ID都会自动变化，双方要互相重新交换ID，否则信息无法正确解密。后期我会解决这个问题。
+    </p>
+    <p>该加密测试工具的加密技术使用了流行的端到端加密算法，并作了相应的改造以及特征伪装优化。密文的破解每条信息的成本都是一个无法企及的天文数字，同时，即使有外人同时获得你的ID，以及你朋友的ID，也是无法破解你的密文。<br/>后期会逐步优化，提升加密强度和伪造度。加密强度将致力于抵抗商用甚至军用的破解，而伪造度将用于躲过各个平台的特征识别。
+    </p>
+</body>
+</html>
